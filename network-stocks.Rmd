@@ -1,0 +1,514 @@
+---
+title: "HW2_Kato"
+author: "Kentaro Kato"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+# Homework 2 
+
+## What we want to prove is.....
+>Stocks from the same GICS sectors should tend to be clustered together
+
+***
+### Procedure
+
+- **Import R libraries and csv file**
+
+- **Functions**
+    + Import data
+    + Bootstrap
+    + igraph
+    
+
+- **Exercises**
+    + Bootstrap
+    + Distance Coveriance
+    + Another period (2013 - 2018)
+    + Implement many data (154 stocks overall)
+
+***
+
+# Import R libraries
+```{r}
+# To deal with stock data.
+library(tseries)
+library(quantmod)
+library(zoo)
+
+# To create igraph
+library(igraph)
+library(RColorBrewer)
+
+# To impliment distance covariance and correlation
+library(energy)
+
+
+```
+
+# csv file
+There is a table of "List of S&P 500 companies" from Wikipedia 
+(URL: https://en.wikipedia.org/wiki/List_of_S%26P_500_companies).
+I convert it to csv file ("table-1.csv") to get symbol of stocks randomly.
+
+```{r}
+# Import csv file 
+allstocks <- read.csv('table-1.csv')
+
+table(allstocks$GICS.Sector)
+
+# All GICS sectors 
+GICS_Sectors = c( "Consumer Discretionary", "Consumer Staples", "Energy", "Financials", 
+                "Health Care", "Industrials", "Information Technology", "Materials",
+                "Real Estate","Communication Services","Utilities")
+
+```
+
+***
+# Functions
+## Import data of stocks
+Import stocks transitions for 2 periods (2003 - 2008, 2013 - 2018) at the same time to be sure that a stock has sensible data both 2 periods. 
+
+To get relative price, I apply to calculate only closing prices. With $c_{t,j}$ denoting the closing price of stock $j$ on day $t$, I consider the variables as follow ( by Borodin et al. (2004))
+$$x_{t,j} = log \frac{c_{t,j}}{c_{t-1,j}}$$
+
+
+```{r echo = T, results = 'hide'}
+options(warn=-1)
+Import_data <- function(STOCKS, D){
+  
+  # The number of stocks for each sectors
+  S <- D / length(GICS_Sectors)
+
+  data1 <- matrix(data = NA, nrow = 1257, ncol = D)
+  data2 <- matrix(data = NA, nrow = 1258, ncol = D)
+  name_list <- c()
+  
+  for (i in 1:length(GICS_Sectors)){
+    
+    a <- which(STOCKS['GICS.Sector'] == GICS_Sectors[i])
+    # Get stock data randomly
+    A <- sample(a, length(a))   
+    
+    j = 0
+    count = 1
+    while (count <= S){
+      
+      tryCatch({
+      name <- as.character(STOCKS$Symbol[A[j]])
+      
+      # Import the period between 2003 and 2008
+      a <- get.hist.quote(instrument = name, 
+                          start="2003-01-01", end="2008-01-01",
+                          quote= c("Close"), provider="yahoo", drop=TRUE)
+      
+       # Import the period between 2013 and 2018
+      b <- get.hist.quote(instrument = name, 
+                          start="2013-01-01", end="2018-01-01",
+                          quote= c("Close"), provider="yahoo", drop=TRUE)
+      
+      }, error=function(e){})
+      
+      # Check there are sensible data, otherwise pick another stock 
+      if (length(a) == 1258 && length(b) == 1259){
+        
+        # Relative price
+        a <- diff(log(a))
+        b <- diff(log(b))
+        data1[, count + (i - 1) * S ] <- a
+        data2[, count + (i - 1) * S ] <- b
+        name_list <- c(name_list, paste(i, name))
+        count = count + 1
+      }
+      j = j + 1
+    }
+  }
+  return ( list ( data1 = data1, data2 = data2, name_list = name_list))
+}
+```
+
+## Bootstrap
+In this step, by using the usual Pearson correlation coefficient between stocks.
+
+During bootstrap, I create confidence intervals simultaneously. 
+```{r}
+Bootstrap <- function (DATA, B = 10000){
+  
+  set.seed(1234)
+  
+  R_hat <- cor(DATA)
+
+  n <- nrow(DATA)   # the number of dates
+  
+  # make a vector to save all delta
+  delta = rep(NA, B)
+  
+  # Start bootstrap
+  for (b in 1:B) {
+    
+    # 1 # Resampling (Get index number)
+    idx = sample(1:n, replace = T)
+    
+    # 2 # Get all values corresponding to index number
+    bsamp   = DATA[idx,]        # bootstrap sample
+    
+    # 3 # Calcurale all correlation
+    R_star = cor(bsamp)
+    
+    # 4 # Get the delta accoding to the equation of PDF file
+    delta_b <- sqrt(n) * max (abs ( R_star - R_hat ))
+    
+    # 5 # Save it to a vector
+    delta[b] <- delta_b
+  
+  }
+  
+  # Assign test statistics
+  alpha = 0.05
+  t_alpha <- quantile(ecdf(delta), prob = (1 - alpha))
+  
+  # Make matrix for inputting 2 values (low and high) of confidence intervals
+  Confidence_Set <- array(NA, dim = c(D, D, 2))
+  
+  Confidence_Set[,,1] <- R_hat - t_alpha/sqrt(n)
+  Confidence_Set[,,2] <- R_hat + t_alpha/sqrt(n)
+  
+  return ( list ( Confidence_Set = Confidence_Set, se = t_alpha/sqrt(n) ) )
+}
+```
+
+## igraph
+```{r}
+# Make a vector for assign color for each vertecies of graph 
+cols <- brewer.pal(11, "Spectral")
+
+# This is vector for making legend. It will used later
+GICS_Sectors_legend = c(  "1 Consumer Discretionary", "2 Consumer Staples", "3 Energy", "4 Financials", 
+                          "5 Health Care", "6 Industrials", "7 Information Technology", "8 Materials",
+                          "9 Real Estate","10 Communication Services","11 Utilities")
+
+# This is a function to make edge-set matrix containing only 1 or 0, from confidense intervals matrix
+
+Make_edge_set1 <- function(Matrix, e){
+  edge_set <- matrix(0, nrow = D, ncol = D)
+  
+  # Get just only the pairs that confidence interval and epsilon do not have intersection
+  edge_set[which ( Matrix[,,2] <  -e) ] <- 1
+  edge_set[which ( Matrix[,,1] >   e) ] <- 1
+  return (edge_set)
+} 
+
+# This is a function to make edge-set matrix containing only 1 or 0, from correlation coefficient matrix
+Make_edge_set2 <- function(Matrix, e){
+  edge_set <- matrix(0, nrow = D, ncol = D)
+  edge_set[which ( Matrix <  -e) ] <- 1
+  edge_set[which ( Matrix >   e) ] <- 1
+  return (edge_set)
+} 
+
+
+# This is a function to make network graph from edge-set
+get_graph <- function(Matrix, e){
+  
+  # make a graph from matrix and delete edge from itself to itself
+  g <- graph.adjacency(Matrix, mode="undirected", weighted=TRUE)
+  g <- simplify(g, remove.multiple=TRUE, remove.loops=TRUE)
+  
+  # assign sectors for each vertex
+  sectors = c()
+  for (i in 1:length(GICS_Sectors)){
+    a <- rep(GICS_Sectors[i], D/length(GICS_Sectors) )
+    sectors <- c(sectors, a)
+  }
+  V(g)$sector <- sectors
+  
+  # assign color for each vertex
+  for (i in 1:length(GICS_Sectors)){
+    V(g)[V(g)$sector == GICS_Sectors[i]]$color <- cols[i]
+  }
+  
+  # assign name for each vertex
+  V(g)$name <- name_list
+  
+  # remove unconnected vertices
+  g <- delete.vertices(g, degree(g)==0)
+  
+  # get the number of vertices
+  nodes <- vcount(g)
+  
+  # color to edges
+  E(g)$color <- "darkred"
+  
+  # plot 
+  plot(g,
+       edge.arrow.size = 3,
+       vertex.label=V(g)$name,
+       vertex.label.font=0.9,
+       vertex.label.size=0.9,
+       vertex.size = 15,
+       vertex.label.color="black",
+       vertex.label.width=1,
+       vertex.label.cex=0.6
+  )
+  
+  # Legend about epsilon
+  legend('topleft', legend = bquote(epsilon == .(e)),
+         text.col='black', cex = 0.9, horiz = T,
+         bty ='n',text.width=0.1)
+  
+  # Lenged about the number of verticesf
+  legend('bottomleft', legend = bquote("number of nodes" == .(nodes)),
+         text.col='black', cex = 0.5, horiz = T,
+         bty ='n',text.width=0.1)
+}
+```
+
+***
+# Exercises
+
+## Load data
+```{r, echo = T, results = 'hide'}
+set.seed(1234)
+
+# the number of stocks
+# I pick 5 stocks for each sectors this time
+# At the last part, I will pick more stocks later
+D = 11 * 5
+
+stocks <- Import_data(allstocks, D)
+data1 <- stocks$data1
+data2 <- stocks$data2
+name_list <- stocks$name_list
+```
+
+## Implement bootstrap & igraph
+```{r, fig.align='center'}
+set.seed(1234)
+Result_boot <- Bootstrap(data1)
+Confidence_Set <- Result_boot$Confidence_Set
+
+epsilon_size = c(0.2, 0.3, 0.4, 0.5)
+par(mfrow=c(2,2), mar=c(0,0,0,0))
+for (e in epsilon_size){
+  edge_set <- Make_edge_set1(Confidence_Set, e)
+  get_graph(edge_set, e)
+}
+
+```
+
+As we can see, if epsilon is greater than 0.3, around half of stocks are removed from graph. 
+Stocks from each sector plotted close in graph even though epsilon is 0.2. 
+When epsilon is greater than 0.4, stocks are separated for each sector.
+
+Now, to see the tendency of stocks transition in detail, I set epsilon equals to 0.3.
+
+```{r, fig.align='center'}
+e = 0.3
+par(mfrow = c(1,1))
+edge_set <- Make_edge_set1(Confidence_Set, e)
+get_graph(edge_set, e)
+legend('left', legend = GICS_Sectors_legend, text.col=cols, cex = 0.6, bty = 'n',
+        pch = 10, pt.cex = 0.3, col = cols, horiz = FALSE)
+```
+In this case, more than 3 stocks in the same sectors ( Energy, Financials, Industrial, Materials, Real Estates, Utilities ) are gathering close. However, high correlation can not be seen in Consumer Discretionary, Information Technology, Communication Services. Also, Any stocks of Consumer Staples and  Health Care are not placed in graph.
+
+Since a few stocks are chosen, we can not say that this result is related to all stocks for sectors. At last step, I will pick more stocks to enable to see the features of sectors.
+
+## Intervals 
+I get these intervals from bootstrap procedure. To prove how close to confidence intervals $C_{n,\alpha} = [L,U]$ by theory, I calculate the one by using Fisher's equation.
+$$L = h^{-1}(Z_{j,k} - z_{\frac{\alpha}{2}}/ \sqrt{n-3})$$
+$$U = h^{-1}(Z_{j,k} + z_{\frac{\alpha}{2}}/ \sqrt{n-3})$$
+where 
+$$Z_{j,k}=h(\hat{\rho}_{j,k})=\frac{1}{2}log(\frac{1+\hat{\rho}_{j,k}}{1-\hat{\rho}_{j,k}})$$
+```{r}
+# Interval from bootstrap procedure
+width <- as.numeric(Result_boot$se)
+
+# Interval from asymptotic test
+alpha <- 0.05
+m <- choose(D, 2)
+n <- nrow(data1)
+z_a2m <- abs( -qnorm(alpha / (2 * m)) * (1 / sqrt(n-3)) ) 
+
+# Comparison
+interval <- matrix( c(width, z_a2m), nrow = 1)
+rownames(interval) <- 'interval'
+colnames(interval) <- c('Bootstrap Procedure', 'Asymptotic Test')
+print(interval)
+
+```
+As we can see, an interval from asymptotic test by Fisher is more strict than the one from bootstrap procedure.
+
+***
+
+## Distance Corvariance
+At this time, igraph will be made by correlation coefficient based on distance covariance. 
+To get correlation coefficient, I am going to do hypothesis testing.
+```{r}
+pval <- c()
+for (j in 1:(D-1)){
+  for (k in (j+1):D){
+    p <- dcov.test(data1[,j], data1[,k], R = 1)$p.value
+    pval = c(pval, p)
+  }
+}
+
+# change index parameter
+pval_index <- c()
+for (i in 1:500){
+  p <- dcov.test(data1[,1], data1[,2], index = i/1000, R = 1)$p.value
+  pval_index <- c(pval_index, p)
+}
+
+#change the R parameter
+pval_R <- c()
+for (i in 1:20){
+  p <- dcov.test(data1[,1], data1[,2],index = 1, R = i)$p.value
+  pval_R <- c(pval_R, p)
+}
+```
+
+```{r, fig.align='center'}
+par(mfrow = c(1,3))
+plot(pval, type="l", main='p-value (index=1, R=1)', xlab = "pairs", ylab = "p-value")
+
+plot(x = seq(1, 500)/1000, y = pval_index, type="l", main='Change by index (R=1)', xlab = "index", ylab = "p-value")
+
+plot(pval_R, type="l", main='Change by R (index=1)', xlab = "R", ylab = "p-value")
+
+```
+
+Now I got the result that every pairs have the same p-value.
+
+Also, I got the same p-value again when $0.05 < index < 5$. Therefore, I assume that $index$ does not matter to p-value.
+
+By contrast, it is clear that the bigger the $R$ is, the smaller the p-value is. Therefore, it is necessary to set a big R to get significant p-value. Also, $dcov.test$ function returns p-value as $\frac{1}{R + 1}$. 
+
+
+When we set $\alpha = 0.05$ , we have to get p-value which is less than $\alpha$ to reject null hypothesis $H_0 (\gamma^2 = 0)$. With the result above, without the Bonferroni method, we have to assign $R \ge 20$. Considering the Bonferroni method, we reject null hypothesis if $p-value < \frac{\alpha}{m} (\text {m is the number of objects})$.
+In this case, since the number of stocks is 55, $m = \binom {55}2 = 1485$. According to this and the dcov.test function, it is necessary to assign $R > 29700$. The test is shown below.
+
+As a result, we recognize that the Bonferroni method is more strict to reject null hypothesis. Plus, if we have a lot of observations, it is more strict.
+
+## the Bonferroni method
+```{r}
+# Without the Bonferroni method (R = 20)
+p <- dcor.test(data1[,1], data1[,2], R = 20)$p.value
+p < alpha
+
+# With the Bonferroni method (R = 20)
+t_bonf <- alpha / choose(D, 2)
+p <- dcor.test(data1[,1], data1[,2], R = 20)$p.value
+p < t_bonf
+
+# Checking by function 'p.adjust' ( R = 29700)
+result <- dcor.test(data1[,1], data1[,2], R = (choose(D, 2) / alpha) )
+pval = rep(result$p.value, choose(D,2))
+pval_bonf <- p.adjust(pval, method = 'bonferroni')
+pval_bonf[1]
+
+
+```
+
+## Correlation coefficient
+After hypothesis testing, I get the distance correlation for each pair. 
+```{r}
+Distance_Correlation <- matrix(data=1, nrow=D, ncol=D)
+
+for (j in 1:(D-1)){
+  for (k in (j+1):D){
+    d <- dcor(data1[,j], data1[,k])
+    Distance_Correlation[j,k] <- d
+    Distance_Correlation[k,j] <- d
+  }
+}
+```
+
+## igraph
+```{r, fig.align='center'}
+epsilon_size = c(0.2, 0.3, 0.4, 0.5)
+par(mfrow=c(2,2), mar=c(0,0,0,0))
+for (e in epsilon_size){
+  edge_set <- Make_edge_set2(Distance_Correlation, e )
+  get_graph(edge_set, e)
+}
+```
+As we can see, when $\epsilon = 0.2, 0.3$, many vertices are remained in graph unlike the one of bootstrap. This is because the correlations that I get is point estimators not set estimators. The limit by $\epsilon$ became loose to enable many stocks to stay on graphs.
+
+Likewise, get closer to see the detail to see the features.
+```{r, fig.align='center'}
+e = 0.4
+par(mfrow = c(1,1))
+edge_set <- Make_edge_set2(Distance_Correlation, e)
+get_graph(edge_set, e)
+legend('left', legend = GICS_Sectors_legend, text.col=cols, cex = 0.6, bty = 'n',
+        pch = 10, pt.cex = 0.3, col = cols, horiz = FALSE)
+```
+The result is almost the same as the one of bootstrap. One thing that I should mention is that vertices of the same sectors are placed separately compared to that of bootstrap. 
+
+***
+
+## 2013 - 2018
+At this step, I apply the same step for the different period between 2013 and 2018. I implement bootstrap procedure because the result is shown better than distance correlation.
+```{r, fig.align='center'}
+Result_boot <- Bootstrap(data2)
+Confidence_Set <- Result_boot$Confidence_Set
+
+epsilon_size = c(0.2, 0.3, 0.4, 0.5)
+par(mfrow=c(2,2), mar=c(0,0,0,0))
+for (e in epsilon_size){
+  edge_set <- Make_edge_set1(Confidence_Set, e)
+  get_graph(edge_set, e)
+}
+```
+Overall, it is obvious that stocks in this period have higher correlation than that of 2003 - 2008. When we look at the graph where $\epsilon = 0.3$, there are 38 nodes in this graph while there are 26 nodes in the past period.
+
+When I see the features of sectors,  Energy, Financials, Industrial, Materials, Real Estates and Utilities are highly correlated as with the past results. When $\epsilon = 0.5$, Utilities are shown on the graph, although Energy stocks are shown on the graph in 2003 - 2008.
+
+***
+# Implement many data (154 stocks overall)
+So far, the stocks that I got are chosen at small scale. Finally, I pick as much as stocks from csv file. I pick 14 stocks for each sectors since only 14 stocks of Materials are available.
+
+## Load data
+```{r echo = T, results = 'hide'}
+
+# the number of stocks
+# I pick 5 stocks for each sectors this time
+# At the last part, I will pick more stocks later
+
+set.seed(1234)
+D = 11 * 14
+
+stocks <- Import_data(allstocks, D)
+data1 <- stocks$data1
+data2 <- stocks$data2
+name_list <- stocks$name_list
+```
+
+## 2003 - 2008
+```{r, fig.align='center'}
+Result_boot <- Bootstrap(data1)
+Confidence_Set <- Result_boot$Confidence_Set
+
+epsilon_size = c(0.2, 0.3, 0.4, 0.5)
+par(mfrow=c(2,2), mar=c(0,0,0,0))
+for (e in epsilon_size){
+  edge_set <- Make_edge_set1(Confidence_Set, e)
+  get_graph(edge_set, e)
+}
+```
+
+## 2013 - 2018
+```{r, fig.align='center'}
+Result_boot <- Bootstrap(data2)
+Confidence_Set <- Result_boot$Confidence_Set
+
+epsilon_size = c(0.2, 0.3, 0.4, 0.5)
+par(mfrow=c(2,2), mar=c(0,0,0,0))
+for (e in epsilon_size){
+  edge_set <- Make_edge_set1(Confidence_Set, e)
+  get_graph(edge_set, e)
+}
+```
+
+Now, it is clear that more stocks are related each other significantly as time goes by. Moreover, we can see clearly that stocks from the same sectors are gathering with similar correlation. Until $\epsilon = 0.3$, at least one stock from all sectors remains in this graph. Thus, we can say for sure that stocks from the same GICS sectors should tend to be clustered together.
